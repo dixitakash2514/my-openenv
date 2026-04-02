@@ -18,7 +18,9 @@ from openenv.core.env_server.types import State
 
 try:
     from ..models import MyAction, MyObservation
-except ImportError:
+except (ImportError, SystemError):
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models import MyAction, MyObservation
 
 

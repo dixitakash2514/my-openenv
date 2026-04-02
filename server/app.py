@@ -38,7 +38,9 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import MyAction, MyObservation
     from .my_env_environment import MyEnvironment
-except (ModuleNotFoundError, ImportError):
+except (ModuleNotFoundError, ImportError, SystemError):
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models import MyAction, MyObservation
     from server.my_env_environment import MyEnvironment
 
@@ -76,9 +78,4 @@ def main(host: str = "0.0.0.0", port: int = 8000):
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()
