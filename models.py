@@ -5,23 +5,43 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Data models for the My Env Environment.
+Data models for the Supply Chain Retail Environment.
 
-The my_env environment is a simple test environment that echoes back messages.
+Three tasks: shelf_restock (easy), delivery_routing (medium), demand_surge (hard).
 """
+
+from typing import Any, Dict, List
 
 from openenv.core.env_server.types import Action, Observation
 from pydantic import Field
 
 
-class MyAction(Action):
-    """Action for the My Env environment - just a message to echo."""
+class SupplyChainAction(Action):
+    """Action for the Supply Chain environment — the agent's decision."""
 
-    message: str = Field(..., description="Message to echo back")
+    decision: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Task-specific decision as a JSON-like dict",
+    )
+    reasoning: str = Field(
+        default="",
+        description="Agent's explanation for its decision",
+    )
 
 
-class MyObservation(Observation):
-    """Observation from the My Env environment - the echoed message."""
+class SupplyChainObservation(Observation):
+    """Observation from the Supply Chain environment."""
 
-    echoed_message: str = Field(default="", description="The echoed message")
-    message_length: int = Field(default=0, description="Length of the echoed message")
+    task_name: str = Field(default="", description="Current task identifier")
+    scenario_text: str = Field(
+        default="", description="Human-readable scenario for the LLM agent"
+    )
+    scenario_data: Dict[str, Any] = Field(
+        default_factory=dict, description="Structured scenario data"
+    )
+    score_breakdown: Dict[str, float] = Field(
+        default_factory=dict, description="Per-criterion scores after grading"
+    )
+    feedback: str = Field(
+        default="", description="Grader feedback text after step"
+    )

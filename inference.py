@@ -1,15 +1,21 @@
 """
-Inference Script for My Env (Echo Environment)
+Inference Script — Supply Chain Retail Environment
+===================================================
+Runs all 3 tasks (shelf_restock, delivery_routing, demand_surge) with an LLM agent.
+
+MANDATORY variables:
+    API_BASE_URL, MODEL_NAME, HF_TOKEN, LOCAL_IMAGE_NAME
 """
 
 import asyncio
+import json
 import os
-import textwrap
-from typing import List, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
-from my_env import MyEnv, MyAction, MyObservation
+from my_env import SupplyChainEnv, SupplyChainAction, SupplyChainObservation
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -17,27 +23,20 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Optional — if you use from_docker_image():
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "my_env-env:latest")
-TASK_NAME = os.getenv("MY_ENV_TASK", "echo")
-BENCHMARK = os.getenv("MY_ENV_BENCHMARK", "my_env")
-MAX_STEPS = 8
-TEMPERATURE = 0.7
-MAX_TOKENS = 150
-SUCCESS_SCORE_THRESHOLD = 0.1
 
-# Max possible reward: each token contributes 0.1
-_MAX_REWARD_PER_STEP = MAX_TOKENS * 0.1
-MAX_TOTAL_REWARD = MAX_STEPS * _MAX_REWARD_PER_STEP
+TASKS = [
+    {"name": "shelf_restock", "seed": 42},
+    {"name": "delivery_routing", "seed": 42},
+    {"name": "demand_surge", "seed": 42},
+]
+BENCHMARK = "supply_chain_retail"
+TEMPERATURE = 0.2
+MAX_TOKENS = 2000
 
-SYSTEM_PROMPT = textwrap.dedent(
-    """
-    You are interacting with a simple echo environment.
-    Each turn you must send a message. The environment will echo it back.
-    Reward is proportional to message length: reward = len(message) * 0.1
-    Your goal is to maximize total reward by sending meaningful, substantive messages.
-    Reply with exactly one message string — no quotes, no prefixes, just the message text.
-    """
-).strip()
 
+# ---------------------------------------------------------------------------
+# Logging helpers (mandatory stdout format)
+# ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -54,96 +53,191 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
-def build_user_prompt(step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
-    history_block = "\n".join(history[-4:]) if history else "None"
-    return textwrap.dedent(
-        f"""
-        Step: {step}
-        Last echoed message: {last_echoed!r}
-        Last reward: {last_reward:.2f}
-        Previous steps:
-        {history_block}
-        Send your next message.
-        """
-    ).strip()
+# ---------------------------------------------------------------------------
+# Task-specific system prompts
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPTS = {
+    "shelf_restock": (
+        "You are a supply chain analyst helping a store manager decide which products to restock.\n"
+        "Analyze the inventory data and select the most urgent products to restock.\n"
+        "Consider: products with low stock relative to daily sales rate and high revenue per unit are most urgent.\n\n"
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '{"restock_products": ["P001", "P002", "P003", "P004"]}\n\n'
+        "Select exactly the number of products specified. Order them by priority (most urgent first).\n"
+        "No explanation, no markdown, just the JSON."
+    ),
+    "delivery_routing": (
+        "You are a logistics dispatcher at a distribution center.\n"
+        "Assign each delivery order to a driver considering:\n"
+        "- Vehicle capacity (total weight per driver must not exceed capacity)\n"
+        "- Delivery deadlines (orders must arrive within their time window)\n"
+        "- Driver shift hours remaining\n"
+        "- Balance workload across drivers\n\n"
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '{"assignments": [{"order_id": "ORD001", "driver_id": "D1"}, {"order_id": "ORD002", "driver_id": "D2"}, ...]}\n\n'
+        "Assign ALL orders. No explanation, no markdown, just the JSON."
+    ),
+    "demand_surge": (
+        "You are a supply chain planner preparing for a demand surge during a festival.\n"
+        "Create a procurement and redistribution plan considering:\n"
+        "- Do NOT order from any supplier marked OFFLINE\n"
+        "- Stay within the given budget\n"
+        "- Maximize demand fulfillment across all product categories\n"
+        "- Avoid overstocking (don't order more than ~120% of forecasted demand)\n"
+        "- Balance inventory across warehouses\n\n"
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '{"procurement_orders": [{"supplier_id": "S1", "product": "rice", "quantity": 100, "destination_warehouse": "WH1"}, ...],\n'
+        ' "redistribution": [{"from_warehouse": "WH1", "to_warehouse": "WH3", "product": "flour", "quantity": 50}, ...]}\n\n'
+        "If no redistribution is needed, use an empty list. No explanation, no markdown, just the JSON."
+    ),
+}
 
 
-def get_model_message(client: OpenAI, step: int, last_echoed: str, last_reward: float, history: List[str]) -> str:
-    user_prompt = build_user_prompt(step, last_echoed, last_reward, history)
+# ---------------------------------------------------------------------------
+# LLM interaction
+# ---------------------------------------------------------------------------
+
+def parse_json_from_text(text: str) -> Dict[str, Any]:
+    """Extract JSON from LLM response, handling markdown code blocks."""
+    # Try direct parse first
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting from markdown code block
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Try finding first { ... } block
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return {}
+
+
+def call_llm(client: OpenAI, system_prompt: str, user_prompt: str) -> str:
+    """Call the LLM and return raw text response."""
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
             stream=False,
         )
-        text = (completion.choices[0].message.content or "").strip()
-        return text if text else "hello"
+        return (completion.choices[0].message.content or "").strip()
     except Exception as exc:
         print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        return "hello"
+        return "{}"
 
 
-async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+def summarize_action(task_name: str, decision: Dict[str, Any]) -> str:
+    """Create a short string summary of the action for [STEP] log."""
+    if task_name == "shelf_restock":
+        picks = decision.get("restock_products", [])
+        return f"restock:[{','.join(str(p) for p in picks[:4])}]"
+    elif task_name == "delivery_routing":
+        assigns = decision.get("assignments", [])
+        return f"assign:{len(assigns)}_orders"
+    elif task_name == "demand_surge":
+        orders = decision.get("procurement_orders", [])
+        redist = decision.get("redistribution", [])
+        return f"procure:{len(orders)}_orders,redist:{len(redist)}_moves"
+    return "unknown"
 
-    env = await MyEnv.from_docker_image(LOCAL_IMAGE_NAME)
 
-    history: List[str] = []
+# ---------------------------------------------------------------------------
+# Task runner
+# ---------------------------------------------------------------------------
+
+async def run_task(
+    env: SupplyChainEnv,
+    client: OpenAI,
+    task_name: str,
+    seed: int,
+) -> None:
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        result = await env.reset()
-        last_echoed = result.observation.echoed_message
-        last_reward = 0.0
+        result = await env.reset(task_name=task_name, seed=seed)
+        scenario_text = result.observation.scenario_text
 
-        for step in range(1, MAX_STEPS + 1):
-            if result.done:
-                break
+        system_prompt = SYSTEM_PROMPTS[task_name]
+        user_prompt = f"Here is the scenario:\n\n{scenario_text}"
 
-            message = get_model_message(client, step, last_echoed, last_reward, history)
+        raw_response = call_llm(client, system_prompt, user_prompt)
+        decision = parse_json_from_text(raw_response)
 
-            result = await env.step(MyAction(message=message))
-            obs = result.observation
+        action = SupplyChainAction(decision=decision)
+        result = await env.step(action)
 
-            reward = result.reward or 0.0
-            done = result.done
-            error = None
+        reward = result.reward or 0.0
+        rewards.append(reward)
+        steps_taken = 1
+        score = reward
+        success = score >= 0.1
 
-            rewards.append(reward)
-            steps_taken = step
-            last_echoed = obs.echoed_message
-            last_reward = reward
+        log_step(
+            step=1,
+            action=summarize_action(task_name, decision),
+            reward=reward,
+            done=True,
+            error=None,
+        )
 
-            log_step(step=step, action=message, reward=reward, done=done, error=error)
+    except Exception as e:
+        print(f"[DEBUG] Task {task_name} error: {e}", flush=True)
+        rewards = [0.0]
+        steps_taken = 1
+        score = 0.0
+        success = False
+        log_step(step=1, action="error", reward=0.0, done=True, error=str(e))
 
-            history.append(f"Step {step}: {message!r} -> reward {reward:+.2f}")
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
-            if done:
-                break
 
-        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
-        score = min(max(score, 0.0), 1.0)
-        success = score >= SUCCESS_SCORE_THRESHOLD
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    env = await SupplyChainEnv.from_docker_image(LOCAL_IMAGE_NAME)
+
+    try:
+        for task_config in TASKS:
+            await run_task(env, client, task_config["name"], task_config["seed"])
     finally:
         try:
             await env.close()
         except Exception as e:
-            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+            print(f"[DEBUG] env.close() error: {e}", flush=True)
 
 
 if __name__ == "__main__":

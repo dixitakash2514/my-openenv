@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""My Env Environment Client."""
+"""Supply Chain Retail Environment Client."""
 
 from typing import Dict
 
@@ -12,71 +12,40 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import MyAction, MyObservation
+from .models import SupplyChainAction, SupplyChainObservation
 
 
-class MyEnv(
-    EnvClient[MyAction, MyObservation, State]
+class SupplyChainEnv(
+    EnvClient[SupplyChainAction, SupplyChainObservation, State]
 ):
     """
-    Client for the My Env Environment.
-
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
+    Client for the Supply Chain Retail Environment.
 
     Example:
-        >>> # Connect to a running server
-        >>> with MyEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
-        ...
-        ...     result = client.step(MyAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
-
-    Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = MyEnv.from_docker_image("my_env-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(MyAction(message="Test"))
-        ... finally:
-        ...     client.close()
+        >>> env = await SupplyChainEnv.from_docker_image("my_env-env:latest")
+        >>> result = await env.reset(task_name="shelf_restock", seed=42)
+        >>> print(result.observation.scenario_text)
+        >>> result = await env.step(SupplyChainAction(decision={...}))
+        >>> print(result.reward)
     """
 
-    def _step_payload(self, action: MyAction) -> Dict:
-        """
-        Convert MyAction to JSON payload for step message.
-
-        Args:
-            action: MyAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
-        """
+    def _step_payload(self, action: SupplyChainAction) -> Dict:
         return {
-            "message": action.message,
+            "decision": action.decision,
+            "reasoning": action.reasoning,
         }
 
-    def _parse_result(self, payload: Dict) -> StepResult[MyObservation]:
-        """
-        Parse server response into StepResult[MyObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with MyObservation
-        """
+    def _parse_result(self, payload: Dict) -> StepResult[SupplyChainObservation]:
         obs_data = payload.get("observation", {})
-        observation = MyObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+        observation = SupplyChainObservation(
+            task_name=obs_data.get("task_name", ""),
+            scenario_text=obs_data.get("scenario_text", ""),
+            scenario_data=obs_data.get("scenario_data", {}),
+            score_breakdown=obs_data.get("score_breakdown", {}),
+            feedback=obs_data.get("feedback", ""),
             done=payload.get("done", False),
             reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
         )
-
         return StepResult(
             observation=observation,
             reward=payload.get("reward"),
@@ -84,15 +53,6 @@ class MyEnv(
         )
 
     def _parse_state(self, payload: Dict) -> State:
-        """
-        Parse server response into State object.
-
-        Args:
-            payload: JSON response from state request
-
-        Returns:
-            State object with episode_id and step_count
-        """
         return State(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),
