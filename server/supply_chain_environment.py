@@ -5,12 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Supply Chain Retail Environment Implementation.
+Supply Chain Retail Environment — Multi-Step with Dynamic Events.
 
-Three tasks with increasing difficulty:
-1. shelf_restock (easy) — prioritize which products to restock
-2. delivery_routing (medium) — assign delivery orders to drivers
-3. demand_surge (hard) — plan procurement under disruption
+Tasks:
+  shelf_restock    (easy,   3 steps) — prioritize restocking with evolving demand
+  delivery_routing (medium, 4 steps) — assign deliveries with live disruptions
+  demand_surge     (hard,   5 steps) — plan procurement as situation evolves
 """
 
 import math
@@ -28,7 +28,6 @@ except (ImportError, SystemError):
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from models import SupplyChainAction, SupplyChainObservation
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,10 +59,10 @@ STORE_LOCATIONS = {
 }
 
 SUPPLIER_NAMES = ["AgriCorp", "FreshSource", "BulkTrade", "QuickSupply"]
-
 PRODUCT_CATEGORIES = ["rice", "cooking_oil", "flour", "sugar", "pulses", "spices"]
 
-VALID_TASKS = {"shelf_restock", "delivery_routing", "demand_surge"}
+TASK_STEPS = {"shelf_restock": 3, "delivery_routing": 4, "demand_surge": 5}
+VALID_TASKS = set(TASK_STEPS.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -73,12 +72,10 @@ VALID_TASKS = {"shelf_restock", "delivery_routing", "demand_surge"}
 
 class SupplyChainEnvironment(Environment):
     """
-    Supply Chain Retail environment with 3 tasks.
+    Supply Chain Retail environment with 3 multi-step tasks.
 
-    Tasks:
-        shelf_restock — Easy: prioritize products for restocking
-        delivery_routing — Medium: assign orders to drivers
-        demand_surge — Hard: plan procurement under disruption
+    Each task has dynamic events that change the scenario mid-episode,
+    requiring the agent to adapt its strategy.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -86,9 +83,12 @@ class SupplyChainEnvironment(Environment):
     def __init__(self):
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._task_name: str = ""
-        self._scenario_data: Dict[str, Any] = {}
         self._rng: random_module.Random = random_module.Random(42)
-        self._done = False
+        self._step_num: int = 0
+        self._max_steps: int = 1
+        self._step_rewards: List[float] = []
+        # Task-specific mutable state
+        self._env_state: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # OpenEnv interface
@@ -104,439 +104,495 @@ class SupplyChainEnvironment(Environment):
         if task_name not in VALID_TASKS:
             task_name = "shelf_restock"
 
-        self._state = State(
-            episode_id=episode_id or str(uuid4()), step_count=0
-        )
+        self._state = State(episode_id=episode_id or str(uuid4()), step_count=0)
         self._task_name = task_name
-        self._done = False
         self._rng = random_module.Random(seed if seed is not None else 42)
+        self._step_num = 0
+        self._max_steps = TASK_STEPS[task_name]
+        self._step_rewards = []
 
         generators = {
-            "shelf_restock": self._generate_shelf_restock,
-            "delivery_routing": self._generate_delivery_routing,
-            "demand_surge": self._generate_demand_surge,
+            "shelf_restock": self._init_shelf_restock,
+            "delivery_routing": self._init_delivery_routing,
+            "demand_surge": self._init_demand_surge,
         }
-        self._scenario_data = generators[task_name]()
-        scenario_text = self._format_scenario_text(task_name, self._scenario_data)
+        generators[task_name]()
+        scenario_text = self._build_scenario_text()
 
         return SupplyChainObservation(
             task_name=task_name,
+            step_number=0,
+            total_steps=self._max_steps,
             scenario_text=scenario_text,
-            scenario_data=self._scenario_data,
+            scenario_data=self._get_public_state(),
             done=False,
             reward=0.0,
         )
 
     def step(self, action: SupplyChainAction, **kwargs) -> SupplyChainObservation:
-        self._state.step_count += 1
-        self._done = True
-
-        # If step called without reset (HTTP stateless mode), do a default reset
         if not self._task_name:
             self.reset(task_name="shelf_restock", seed=42)
 
-        graders = {
-            "shelf_restock": self._grade_shelf_restock,
-            "delivery_routing": self._grade_delivery_routing,
-            "demand_surge": self._grade_demand_surge,
+        self._step_num += 1
+        self._state.step_count = self._step_num
+
+        step_handlers = {
+            "shelf_restock": self._step_shelf_restock,
+            "delivery_routing": self._step_delivery_routing,
+            "demand_surge": self._step_demand_surge,
         }
 
-        score, breakdown, feedback = graders[self._task_name](action.decision)
-        score = max(0.0, min(1.0, score))
+        reward, feedback = step_handlers[self._task_name](action.decision)
+        reward = max(0.0, min(1.0, reward))
+        self._step_rewards.append(reward)
 
-        return SupplyChainObservation(
-            task_name=self._task_name,
-            scenario_text="",
-            scenario_data={},
-            score_breakdown=breakdown,
-            feedback=feedback,
-            done=True,
-            reward=score,
-        )
+        is_done = self._step_num >= self._max_steps
+
+        # Build next observation
+        if is_done:
+            final_score = sum(self._step_rewards) / len(self._step_rewards)
+            breakdown = self._get_final_breakdown()
+            final_feedback = (
+                f"Episode complete. Final score: {final_score:.3f} | "
+                f"Step scores: {', '.join(f'{r:.2f}' for r in self._step_rewards)} | "
+                f"{feedback}"
+            )
+            return SupplyChainObservation(
+                task_name=self._task_name,
+                step_number=self._step_num,
+                total_steps=self._max_steps,
+                scenario_text="",
+                scenario_data={},
+                score_breakdown=breakdown,
+                feedback=final_feedback,
+                done=True,
+                reward=final_score,
+            )
+        else:
+            scenario_text = self._build_scenario_text()
+            return SupplyChainObservation(
+                task_name=self._task_name,
+                step_number=self._step_num,
+                total_steps=self._max_steps,
+                scenario_text=scenario_text,
+                scenario_data=self._get_public_state(),
+                feedback=f"Step {self._step_num} reward: {reward:.2f} | {feedback}",
+                done=False,
+                reward=reward,
+            )
 
     @property
     def state(self) -> State:
         return self._state
 
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    def _get_public_state(self) -> Dict[str, Any]:
+        """Return the public portion of state (no internal grading data)."""
+        return {
+            k: v
+            for k, v in self._env_state.items()
+            if not k.startswith("_")
+        }
+
+    def _get_final_breakdown(self) -> Dict[str, float]:
+        """Per-step reward breakdown."""
+        breakdown = {}
+        for i, r in enumerate(self._step_rewards):
+            breakdown[f"step_{i+1}_reward"] = round(r, 3)
+        breakdown["final_score"] = round(
+            sum(self._step_rewards) / len(self._step_rewards), 3
+        )
+        return breakdown
+
     # ==================================================================
-    # TASK 1: Shelf Restock Priority (Easy)
+    # TASK 1: Shelf Restock (3 steps)
+    #
+    # Step 1: Pick 2 most urgent products to restock
+    # Step 2: Dynamic event (demand spike + surprise delivery). Pick 1 more.
+    # Step 3: Final pick (1 more). Episode done.
     # ==================================================================
 
-    def _generate_shelf_restock(self) -> Dict[str, Any]:
+    def _init_shelf_restock(self):
         rng = self._rng
-        num_products = 10
-        restock_slots = 4
         products = []
-        selected = rng.sample(PRODUCT_CATALOG, num_products)
-
-        for pid, name, base_revenue in selected:
+        selected = rng.sample(PRODUCT_CATALOG, 10)
+        for pid, name, base_rev in selected:
             daily_sales = round(rng.uniform(5, 50), 1)
-            shelf_capacity = rng.randint(40, 100)
-            current_stock = rng.randint(0, int(shelf_capacity * 0.4))
-            unit_revenue = round(base_revenue * rng.uniform(0.8, 1.2), 2)
-            products.append(
-                {
-                    "product_id": pid,
-                    "name": name,
-                    "current_stock": current_stock,
-                    "daily_sales_rate": daily_sales,
-                    "shelf_capacity": shelf_capacity,
-                    "unit_revenue": unit_revenue,
-                }
-            )
+            capacity = rng.randint(40, 100)
+            stock = rng.randint(0, int(capacity * 0.4))
+            revenue = round(base_rev * rng.uniform(0.8, 1.2), 2)
+            products.append({
+                "product_id": pid, "name": name,
+                "current_stock": stock, "daily_sales_rate": daily_sales,
+                "shelf_capacity": capacity, "unit_revenue": revenue,
+            })
 
-        return {"products": products, "restock_slots": restock_slots}
+        self._env_state = {
+            "products": products,
+            "restocked": [],  # IDs already restocked
+            "slots_per_step": [2, 1, 1],  # 4 total
+            "_events_applied": [],
+        }
 
-    def _grade_shelf_restock(
-        self, decision: Dict[str, Any]
-    ) -> Tuple[float, Dict[str, float], str]:
-        products = self._scenario_data["products"]
-        restock_slots = self._scenario_data["restock_slots"]
+    def _step_shelf_restock(self, decision: Dict) -> Tuple[float, str]:
+        s = self._env_state
+        products = s["products"]
+        step = self._step_num  # 1, 2, or 3
+        slots = s["slots_per_step"][step - 1]
 
-        # Compute optimal ranking by urgency
+        # --- Apply dynamic event before grading step 2+ ---
+        if step == 2:
+            self._apply_shelf_event()
+
+        # --- Grade the decision ---
+        picks = decision.get("restock_products", [])
+        if not isinstance(picks, list):
+            picks = []
+
+        valid_ids = {p["product_id"] for p in products} - set(s["restocked"])
+        valid_picks = [p for p in picks if p in valid_ids][:slots]
+
+        # Compute urgency ranking on current data (excluding already restocked)
         urgency = []
         for p in products:
+            if p["product_id"] in s["restocked"]:
+                continue
             stock = max(p["current_stock"], 0.1)
-            score = (p["daily_sales_rate"] * p["unit_revenue"]) / stock
-            urgency.append((p["product_id"], score))
+            u = (p["daily_sales_rate"] * p["unit_revenue"]) / stock
+            urgency.append((p["product_id"], u))
         urgency.sort(key=lambda x: x[1], reverse=True)
-        optimal_ids = [u[0] for u in urgency[:restock_slots]]
+        optimal = [u[0] for u in urgency[:slots]]
 
-        # Parse agent's decision
-        agent_picks = decision.get("restock_products", [])
-        if not isinstance(agent_picks, list):
-            agent_picks = []
+        # Selection score
+        correct = set(valid_picks) & set(optimal)
+        selection_score = len(correct) / slots if slots > 0 else 0.0
 
-        valid_product_ids = {p["product_id"] for p in products}
-
-        # --- Feasibility (20%) ---
-        valid_picks = [p for p in agent_picks if p in valid_product_ids]
-        if len(agent_picks) == restock_slots and len(valid_picks) == restock_slots:
+        # Feasibility
+        if len(valid_picks) == slots:
             feasibility = 1.0
         elif len(valid_picks) > 0:
-            feasibility = 0.5 * (len(valid_picks) / restock_slots)
+            feasibility = 0.5
         else:
             feasibility = 0.0
 
-        # --- Selection quality (50%) ---
-        correct = set(valid_picks) & set(optimal_ids)
-        selection = len(correct) / restock_slots if restock_slots > 0 else 0.0
+        reward = 0.6 * selection_score + 0.4 * feasibility
 
-        # --- Priority order (30%) ---
-        if len(correct) >= 2:
-            # Check ordering among correctly selected items
-            optimal_rank = {pid: i for i, pid in enumerate(optimal_ids)}
-            correct_in_agent_order = [p for p in valid_picks if p in correct]
-            correct_optimal_order = sorted(
-                correct_in_agent_order, key=lambda x: optimal_rank.get(x, 99)
-            )
-            # Count concordant pairs
-            n = len(correct_in_agent_order)
-            concordant = 0
-            total_pairs = 0
-            for i in range(n):
-                for j in range(i + 1, n):
-                    total_pairs += 1
-                    rank_i_agent = correct_in_agent_order.index(
-                        correct_in_agent_order[i]
-                    )
-                    rank_j_agent = correct_in_agent_order.index(
-                        correct_in_agent_order[j]
-                    )
-                    rank_i_opt = correct_optimal_order.index(
-                        correct_in_agent_order[i]
-                    )
-                    rank_j_opt = correct_optimal_order.index(
-                        correct_in_agent_order[j]
-                    )
-                    if (rank_i_agent - rank_j_agent) * (rank_i_opt - rank_j_opt) > 0:
-                        concordant += 1
-            priority = concordant / total_pairs if total_pairs > 0 else 1.0
-        elif len(correct) == 1:
-            priority = 0.5
-        else:
-            priority = 0.0
+        # Apply restock: update stock for picked products
+        for pid in valid_picks:
+            for p in products:
+                if p["product_id"] == pid:
+                    p["current_stock"] = p["shelf_capacity"]
+                    break
+            s["restocked"].append(pid)
 
-        total = 0.50 * selection + 0.30 * priority + 0.20 * feasibility
-
-        breakdown = {
-            "selection_quality": round(selection, 3),
-            "priority_order": round(priority, 3),
-            "feasibility": round(feasibility, 3),
-        }
-        feedback_parts = [f"Score: {total:.2f}/1.00"]
-        feedback_parts.append(
-            f"Optimal top-{restock_slots}: {optimal_ids}"
+        feedback = (
+            f"Picked: {valid_picks} | Optimal: {optimal} | "
+            f"Correct: {len(correct)}/{slots}"
         )
-        feedback_parts.append(f"Your picks: {agent_picks}")
-        feedback_parts.append(
-            f"Correct selections: {len(correct)}/{restock_slots}"
-        )
-        return total, breakdown, " | ".join(feedback_parts)
+        return reward, feedback
 
-    # ==================================================================
-    # TASK 2: Delivery Route Assignment (Medium)
-    # ==================================================================
-
-    def _generate_delivery_routing(self) -> Dict[str, Any]:
+    def _apply_shelf_event(self):
+        """Dynamic event before step 2: demand spike + surprise delivery."""
         rng = self._rng
-        store_names = list(STORE_LOCATIONS.keys())
-        store_names.remove("DC")
-        selected_stores = rng.sample(store_names, 6)
+        products = self._env_state["products"]
+        available = [
+            p for p in products
+            if p["product_id"] not in self._env_state["restocked"]
+        ]
+        if len(available) >= 2:
+            # One product's sales spike
+            spike_product = rng.choice(available)
+            old_rate = spike_product["daily_sales_rate"]
+            spike_product["daily_sales_rate"] = round(old_rate * 1.8, 1)
 
-        orders = []
-        for i, store in enumerate(selected_stores):
-            order_id = f"ORD{i+1:03d}"
-            weight = round(rng.uniform(20, 150), 1)
-            deadline_hours = round(rng.uniform(1.5, 5.0), 1)
-            priority = rng.choice(["standard", "express"])
-            orders.append(
-                {
-                    "order_id": order_id,
-                    "destination": store,
-                    "weight_kg": weight,
-                    "deadline_hours": deadline_hours,
-                    "priority": priority,
-                }
+            # Another product gets a surprise delivery
+            others = [p for p in available if p != spike_product]
+            delivery_product = rng.choice(others)
+            bonus = rng.randint(15, 30)
+            delivery_product["current_stock"] = min(
+                delivery_product["current_stock"] + bonus,
+                delivery_product["shelf_capacity"],
             )
+
+            self._env_state["_events_applied"].append(
+                f"DEMAND SPIKE: {spike_product['name']} sales rate jumped from "
+                f"{old_rate} to {spike_product['daily_sales_rate']}/day. "
+                f"DELIVERY: {delivery_product['name']} received +{bonus} units."
+            )
+
+    # ==================================================================
+    # TASK 2: Delivery Routing (4 steps)
+    #
+    # Step 1: Assign 4 initial orders to 3 drivers
+    # Step 2: 2 new urgent orders arrive + traffic delay
+    # Step 3: Driver reports vehicle issue (capacity drop)
+    # Step 4: Final adjustments
+    # ==================================================================
+
+    def _init_delivery_routing(self):
+        rng = self._rng
+        store_names = [s for s in STORE_LOCATIONS if s != "DC"]
+        selected = rng.sample(store_names, 6)
+
+        # Generate 4 initial orders (2 more added at step 2)
+        orders = []
+        for i in range(4):
+            orders.append({
+                "order_id": f"ORD{i+1:03d}",
+                "destination": selected[i],
+                "weight_kg": round(rng.uniform(20, 120), 1),
+                "deadline_hours": round(rng.uniform(2.0, 5.0), 1),
+                "priority": rng.choice(["standard", "standard", "express"]),
+                "status": "pending",
+            })
+
+        # Pre-generate the 2 urgent orders for step 2
+        urgent_orders = []
+        for i in range(4, 6):
+            urgent_orders.append({
+                "order_id": f"ORD{i+1:03d}",
+                "destination": selected[i],
+                "weight_kg": round(rng.uniform(30, 80), 1),
+                "deadline_hours": round(rng.uniform(1.0, 2.5), 1),
+                "priority": "express",
+                "status": "pending",
+            })
 
         drivers = []
         for i in range(3):
-            driver_id = f"D{i+1}"
-            capacity = rng.randint(200, 400)
-            shift_hours = round(rng.uniform(4.0, 8.0), 1)
-            drivers.append(
-                {
-                    "driver_id": driver_id,
-                    "vehicle_capacity_kg": capacity,
-                    "remaining_shift_hours": shift_hours,
-                }
-            )
+            drivers.append({
+                "driver_id": f"D{i+1}",
+                "vehicle_capacity_kg": rng.randint(200, 400),
+                "remaining_shift_hours": round(rng.uniform(5.0, 8.0), 1),
+                "assigned_orders": [],
+                "used_capacity_kg": 0.0,
+            })
 
-        # Precompute distances from DC to each store
         distances = {}
-        for store in selected_stores:
+        for store in selected:
             loc = STORE_LOCATIONS[store]
             dc = STORE_LOCATIONS["DC"]
-            dist = math.sqrt((loc[0] - dc[0]) ** 2 + (loc[1] - dc[1]) ** 2)
-            distances[store] = round(dist, 1)
+            distances[store] = round(
+                math.sqrt((loc[0] - dc[0]) ** 2 + (loc[1] - dc[1]) ** 2), 1
+            )
 
-        return {
+        self._env_state = {
             "orders": orders,
             "drivers": drivers,
             "distances_from_dc": distances,
             "speed_kmh": 30,
+            "_urgent_orders": urgent_orders,
+            "_traffic_delay_store": selected[rng.randint(0, 3)],
+            "_broken_driver": f"D{rng.randint(1, 3)}",
+            "_events_applied": [],
         }
 
-    def _grade_delivery_routing(
-        self, decision: Dict[str, Any]
-    ) -> Tuple[float, Dict[str, float], str]:
-        orders = self._scenario_data["orders"]
-        drivers = self._scenario_data["drivers"]
-        distances = self._scenario_data["distances_from_dc"]
-        speed = self._scenario_data["speed_kmh"]
+    def _step_delivery_routing(self, decision: Dict) -> Tuple[float, str]:
+        s = self._env_state
+        step = self._step_num
 
-        assignments_raw = decision.get("assignments", [])
-        if not isinstance(assignments_raw, list):
-            assignments_raw = []
+        # Apply dynamic events
+        if step == 2:
+            self._apply_routing_event_step2()
+        elif step == 3:
+            self._apply_routing_event_step3()
 
-        order_map = {o["order_id"]: o for o in orders}
+        # Parse assignments from this step
+        assignments = decision.get("assignments", [])
+        if not isinstance(assignments, list):
+            assignments = []
+
+        orders = s["orders"]
+        drivers = s["drivers"]
+        distances = s["distances_from_dc"]
+        speed = s["speed_kmh"]
+
+        order_map = {o["order_id"]: o for o in orders if o["status"] == "pending"}
         driver_map = {d["driver_id"]: d for d in drivers}
-        valid_order_ids = set(order_map.keys())
-        valid_driver_ids = set(driver_map.keys())
 
-        # Parse assignments
-        driver_orders: Dict[str, List[Dict]] = {d: [] for d in valid_driver_ids}
-        assigned_orders = set()
-        invalid_count = 0
-
-        for a in assignments_raw:
+        newly_assigned = 0
+        for a in assignments:
             if not isinstance(a, dict):
-                invalid_count += 1
                 continue
             oid = a.get("order_id", "")
             did = a.get("driver_id", "")
-            if oid in valid_order_ids and did in valid_driver_ids and oid not in assigned_orders:
-                driver_orders[did].append(order_map[oid])
-                assigned_orders.add(oid)
-            else:
-                invalid_count += 1
+            if oid not in order_map or did not in driver_map:
+                continue
+            order = order_map[oid]
+            driver = driver_map[did]
 
-        unassigned = valid_order_ids - assigned_orders
+            # Apply assignment
+            remaining_cap = driver["vehicle_capacity_kg"] - driver["used_capacity_kg"]
+            if order["weight_kg"] <= remaining_cap:
+                driver["assigned_orders"].append(oid)
+                driver["used_capacity_kg"] += order["weight_kg"]
+                order["status"] = "assigned"
+                newly_assigned += 1
 
-        # --- On-time delivery (35%) ---
+        # Grade this step
+        pending = [o for o in orders if o["status"] == "pending"]
+        total = len(orders)
+        assigned_total = sum(1 for o in orders if o["status"] == "assigned")
+
+        # On-time check for assigned orders
         on_time = 0
-        total_orders = len(orders)
-        for did, ord_list in driver_orders.items():
-            travel_time = 0.0
-            for o in ord_list:
-                dest = o["destination"]
-                dist = distances.get(dest, 20.0)
-                travel_time += dist / speed
-                if travel_time <= o["deadline_hours"]:
-                    on_time += 1
-        # Unassigned orders are never on-time
-        on_time_score = on_time / total_orders if total_orders > 0 else 0.0
+        for d in drivers:
+            travel = 0.0
+            for oid in d["assigned_orders"]:
+                order = next((o for o in orders if o["order_id"] == oid), None)
+                if order:
+                    dist = distances.get(order["destination"], 20.0)
+                    travel += dist / speed
+                    if travel <= order["deadline_hours"]:
+                        on_time += 1
 
-        # --- Capacity compliance (25%) ---
-        capacity_violations = 0
-        for did, ord_list in driver_orders.items():
-            total_weight = sum(o["weight_kg"] for o in ord_list)
-            cap = driver_map[did]["vehicle_capacity_kg"]
-            if total_weight > cap:
-                capacity_violations += 1
-        capacity_score = 1.0 - (capacity_violations / len(drivers))
+        on_time_rate = on_time / assigned_total if assigned_total > 0 else 0.0
 
-        # --- Efficiency (25%) ---
-        total_distance = 0.0
-        for did, ord_list in driver_orders.items():
-            for o in ord_list:
-                total_distance += distances.get(o["destination"], 20.0)
-
-        # Greedy optimal: assign each order to nearest slot
-        optimal_distance = sum(distances.get(o["destination"], 20.0) for o in orders)
-        if optimal_distance > 0 and total_distance > 0:
-            efficiency_score = min(1.0, optimal_distance / total_distance)
-        elif total_distance == 0 and len(assigned_orders) == 0:
-            efficiency_score = 0.0
-        else:
-            efficiency_score = 0.5
-
-        # --- Driver balance (15%) ---
-        counts = [len(v) for v in driver_orders.values()]
-        if len(counts) > 1 and sum(counts) > 0:
-            mean_count = sum(counts) / len(counts)
-            variance = sum((c - mean_count) ** 2 for c in counts) / len(counts)
-            std_dev = math.sqrt(variance)
-            balance_score = max(0.0, 1.0 - std_dev / mean_count) if mean_count > 0 else 0.0
-        elif sum(counts) > 0:
-            balance_score = 1.0
-        else:
-            balance_score = 0.0
-
-        # Penalty for unassigned orders
-        coverage = len(assigned_orders) / total_orders if total_orders > 0 else 0.0
-        coverage_penalty = coverage  # scale all scores by coverage
-
-        total = coverage_penalty * (
-            0.35 * on_time_score
-            + 0.25 * capacity_score
-            + 0.25 * efficiency_score
-            + 0.15 * balance_score
+        # Capacity check
+        violations = sum(
+            1 for d in drivers if d["used_capacity_kg"] > d["vehicle_capacity_kg"]
         )
+        cap_score = 1.0 - violations / len(drivers)
 
-        breakdown = {
-            "on_time_delivery": round(on_time_score, 3),
-            "capacity_compliance": round(capacity_score, 3),
-            "efficiency": round(efficiency_score, 3),
-            "driver_balance": round(balance_score, 3),
-            "coverage": round(coverage, 3),
-        }
+        # Coverage (how many orders assigned so far vs total)
+        coverage = assigned_total / total if total > 0 else 0.0
+
+        # Balance
+        counts = [len(d["assigned_orders"]) for d in drivers]
+        if sum(counts) > 0:
+            mean_c = sum(counts) / len(counts)
+            var = sum((c - mean_c) ** 2 for c in counts) / len(counts)
+            balance = max(0.0, 1.0 - math.sqrt(var) / max(mean_c, 1))
+        else:
+            balance = 0.0
+
+        reward = 0.30 * on_time_rate + 0.25 * cap_score + 0.25 * coverage + 0.20 * balance
+
         feedback = (
-            f"Score: {total:.2f}/1.00 | "
-            f"Assigned: {len(assigned_orders)}/{total_orders} | "
-            f"On-time: {on_time}/{total_orders} | "
-            f"Capacity violations: {capacity_violations} | "
-            f"Unassigned: {len(unassigned)}"
+            f"Assigned this step: {newly_assigned} | "
+            f"Total assigned: {assigned_total}/{total} | "
+            f"On-time: {on_time} | Capacity violations: {violations}"
         )
-        return total, breakdown, feedback
+        return reward, feedback
+
+    def _apply_routing_event_step2(self):
+        """2 new urgent orders + traffic delay."""
+        s = self._env_state
+        s["orders"].extend(s["_urgent_orders"])
+        store = s["_traffic_delay_store"]
+        if store in s["distances_from_dc"]:
+            s["distances_from_dc"][store] = round(
+                s["distances_from_dc"][store] * 2.0, 1
+            )
+        s["_events_applied"].append(
+            f"NEW ORDERS: 2 urgent express orders added. "
+            f"TRAFFIC: Route to {store} now takes 2x longer."
+        )
+
+    def _apply_routing_event_step3(self):
+        """Driver reports vehicle issue — capacity reduced."""
+        s = self._env_state
+        did = s["_broken_driver"]
+        for d in s["drivers"]:
+            if d["driver_id"] == did:
+                old_cap = d["vehicle_capacity_kg"]
+                d["vehicle_capacity_kg"] = int(old_cap * 0.6)
+                s["_events_applied"].append(
+                    f"VEHICLE ISSUE: {did} capacity reduced from "
+                    f"{old_cap}kg to {d['vehicle_capacity_kg']}kg."
+                )
+                break
 
     # ==================================================================
-    # TASK 3: Demand Surge Planning with Disruption (Hard)
+    # TASK 3: Demand Surge (5 steps)
+    #
+    # Step 1: Initial procurement plan (all suppliers active)
+    # Step 2: Disruption — one supplier goes offline
+    # Step 3: Demand forecast updates
+    # Step 4: Warehouse capacity alert — redistribute
+    # Step 5: Final review
     # ==================================================================
 
-    def _generate_demand_surge(self) -> Dict[str, Any]:
+    def _init_demand_surge(self):
         rng = self._rng
-
-        # Warehouses
         warehouses = []
         for i in range(3):
-            wh_id = f"WH{i+1}"
             inventory = {}
-            max_capacity = rng.randint(800, 1500)
-            current_total = 0
+            cap = rng.randint(800, 1500)
+            total = 0
             for cat in PRODUCT_CATEGORIES:
                 qty = rng.randint(20, 150)
                 inventory[cat] = qty
-                current_total += qty
-            warehouses.append(
-                {
-                    "warehouse_id": wh_id,
-                    "inventory": inventory,
-                    "max_capacity": max_capacity,
-                    "current_total": current_total,
-                }
-            )
+                total += qty
+            warehouses.append({
+                "warehouse_id": f"WH{i+1}", "inventory": inventory,
+                "max_capacity": cap, "current_total": total,
+            })
 
-        # Suppliers (one will be offline)
         suppliers = []
         for i, name in enumerate(SUPPLIER_NAMES):
-            sid = f"S{i+1}"
-            suppliers.append(
-                {
-                    "supplier_id": sid,
-                    "name": name,
-                    "price_per_unit": round(rng.uniform(2.0, 8.0), 2),
-                    "lead_time_days": rng.randint(1, 4),
-                    "reliability_score": round(rng.uniform(0.5, 1.0), 2),
-                    "max_order_qty": rng.randint(200, 600),
-                    "status": "ACTIVE",
-                }
-            )
-        # Mark one supplier as offline
-        offline_idx = rng.randint(0, len(suppliers) - 1)
-        suppliers[offline_idx]["status"] = "OFFLINE"
+            suppliers.append({
+                "supplier_id": f"S{i+1}", "name": name,
+                "price_per_unit": round(rng.uniform(2.0, 8.0), 2),
+                "lead_time_days": rng.randint(1, 4),
+                "reliability_score": round(rng.uniform(0.5, 1.0), 2),
+                "max_order_qty": rng.randint(200, 600),
+                "status": "ACTIVE",
+            })
 
-        # Store demand forecasts (surge in 5 days)
         stores = []
-        store_names = ["Downtown Store", "Mall Outlet", "Suburban Branch"]
-        for s_name in store_names:
-            demand = {}
-            for cat in PRODUCT_CATEGORIES:
-                # Surge = higher demand
-                demand[cat] = rng.randint(40, 200)
+        for s_name in ["Downtown Store", "Mall Outlet", "Suburban Branch"]:
+            demand = {cat: rng.randint(40, 200) for cat in PRODUCT_CATEGORIES}
             stores.append({"store_name": s_name, "demand_forecast": demand})
 
-        # Budget
-        budget = round(rng.uniform(3000, 6000), 0)
+        budget = round(rng.uniform(5000, 9000), 0)
 
-        # Total demand for reference
         total_demand = {}
         for cat in PRODUCT_CATEGORIES:
             total_demand[cat] = sum(s["demand_forecast"][cat] for s in stores)
 
-        return {
+        self._env_state = {
             "warehouses": warehouses,
             "suppliers": suppliers,
             "stores": stores,
             "budget": budget,
+            "budget_remaining": budget,
             "surge_days": 5,
             "total_demand": total_demand,
+            "procurement_log": [],
+            "redistribution_log": [],
+            "_offline_supplier": f"S{rng.randint(1, 4)}",
+            "_demand_changes": {
+                rng.choice(PRODUCT_CATEGORIES): 1.4,
+                rng.choice(PRODUCT_CATEGORIES): 0.7,
+            },
+            "_capacity_alert_wh": f"WH{rng.randint(1, 3)}",
+            "_events_applied": [],
         }
 
-    def _grade_demand_surge(
-        self, decision: Dict[str, Any]
-    ) -> Tuple[float, Dict[str, float], str]:
-        data = self._scenario_data
-        warehouses = {w["warehouse_id"]: dict(w) for w in data["warehouses"]}
-        suppliers = {s["supplier_id"]: s for s in data["suppliers"]}
-        total_demand = data["total_demand"]
-        budget = data["budget"]
+    def _step_demand_surge(self, decision: Dict) -> Tuple[float, str]:
+        s = self._env_state
+        step = self._step_num
 
+        # Apply events at appropriate steps
+        if step == 2:
+            self._apply_surge_event_step2()
+        elif step == 3:
+            self._apply_surge_event_step3()
+        elif step == 4:
+            self._apply_surge_event_step4()
+
+        # Process procurement orders
         procurement = decision.get("procurement_orders", [])
         if not isinstance(procurement, list):
             procurement = []
-        redistribution = decision.get("redistribution", [])
-        if not isinstance(redistribution, list):
-            redistribution = []
 
-        # --- Process procurement orders ---
-        total_cost = 0.0
-        ordered_to_offline = 0
-        incoming: Dict[str, Dict[str, int]] = {
-            wh: {cat: 0 for cat in PRODUCT_CATEGORIES}
-            for wh in warehouses
-        }
+        suppliers = {sup["supplier_id"]: sup for sup in s["suppliers"]}
+        ordered_offline = 0
+        step_cost = 0.0
 
         for order in procurement:
             if not isinstance(order, dict):
@@ -544,31 +600,45 @@ class SupplyChainEnvironment(Environment):
             sid = order.get("supplier_id", "")
             product = order.get("product", "")
             qty = order.get("quantity", 0)
-            dest_wh = order.get("destination_warehouse", "")
+            dest = order.get("destination_warehouse", "")
 
             if not isinstance(qty, (int, float)) or qty <= 0:
                 continue
             qty = int(qty)
-
-            if sid not in suppliers:
-                continue
-            supplier = suppliers[sid]
-
-            if supplier["status"] == "OFFLINE":
-                ordered_to_offline += 1
-                continue  # Order won't be fulfilled
-
-            if product not in PRODUCT_CATEGORIES:
-                continue
-            if dest_wh not in warehouses:
+            if sid not in suppliers or product not in PRODUCT_CATEGORIES:
                 continue
 
-            actual_qty = min(qty, supplier["max_order_qty"])
-            cost = actual_qty * supplier["price_per_unit"]
-            total_cost += cost
-            incoming[dest_wh][product] += actual_qty
+            sup = suppliers[sid]
+            if sup["status"] == "OFFLINE":
+                ordered_offline += 1
+                continue
 
-        # --- Process redistribution ---
+            wh = next((w for w in s["warehouses"] if w["warehouse_id"] == dest), None)
+            if not wh:
+                continue
+
+            actual_qty = min(qty, sup["max_order_qty"])
+            cost = actual_qty * sup["price_per_unit"]
+            if cost > s["budget_remaining"]:
+                actual_qty = int(s["budget_remaining"] / sup["price_per_unit"])
+                cost = actual_qty * sup["price_per_unit"]
+            if actual_qty <= 0:
+                continue
+
+            s["budget_remaining"] -= cost
+            step_cost += cost
+            wh["inventory"][product] = wh["inventory"].get(product, 0) + actual_qty
+            wh["current_total"] += actual_qty
+            s["procurement_log"].append({
+                "step": step, "supplier": sid, "product": product,
+                "quantity": actual_qty, "cost": cost, "warehouse": dest,
+            })
+
+        # Process redistribution
+        redistribution = decision.get("redistribution", [])
+        if not isinstance(redistribution, list):
+            redistribution = []
+
         for move in redistribution:
             if not isinstance(move, dict):
                 continue
@@ -576,257 +646,312 @@ class SupplyChainEnvironment(Environment):
             to_wh = move.get("to_warehouse", "")
             product = move.get("product", "")
             qty = move.get("quantity", 0)
-
             if not isinstance(qty, (int, float)) or qty <= 0:
                 continue
             qty = int(qty)
-
-            if (
-                from_wh not in warehouses
-                or to_wh not in warehouses
-                or product not in PRODUCT_CATEGORIES
-            ):
+            if product not in PRODUCT_CATEGORIES:
                 continue
 
-            available = warehouses[from_wh]["inventory"].get(product, 0)
-            actual_move = min(qty, available)
-            warehouses[from_wh]["inventory"][product] -= actual_move
-            if to_wh not in incoming:
-                incoming[to_wh] = {cat: 0 for cat in PRODUCT_CATEGORIES}
-            incoming[to_wh][product] += actual_move
+            src = next((w for w in s["warehouses"] if w["warehouse_id"] == from_wh), None)
+            dst = next((w for w in s["warehouses"] if w["warehouse_id"] == to_wh), None)
+            if not src or not dst:
+                continue
 
-        # --- Compute available supply per category ---
-        total_supply: Dict[str, int] = {cat: 0 for cat in PRODUCT_CATEGORIES}
-        for wh_id, wh in warehouses.items():
+            actual = min(qty, src["inventory"].get(product, 0))
+            if actual > 0:
+                src["inventory"][product] -= actual
+                src["current_total"] -= actual
+                dst["inventory"][product] = dst["inventory"].get(product, 0) + actual
+                dst["current_total"] += actual
+                s["redistribution_log"].append({
+                    "step": step, "from": from_wh, "to": to_wh,
+                    "product": product, "quantity": actual,
+                })
+
+        # --- Grade this step ---
+        total_demand = s["total_demand"]
+
+        # Fulfillment
+        total_supply = {cat: 0 for cat in PRODUCT_CATEGORIES}
+        for wh in s["warehouses"]:
             for cat in PRODUCT_CATEGORIES:
                 total_supply[cat] += wh["inventory"].get(cat, 0)
-                total_supply[cat] += incoming.get(wh_id, {}).get(cat, 0)
 
-        # --- Demand fulfillment (30%) ---
         fulfillment_rates = []
         for cat in PRODUCT_CATEGORIES:
-            demand = total_demand.get(cat, 1)
-            supply = total_supply.get(cat, 0)
-            rate = min(1.0, supply / demand) if demand > 0 else 1.0
-            fulfillment_rates.append(rate)
-        demand_fulfillment = sum(fulfillment_rates) / len(fulfillment_rates)
+            d = total_demand.get(cat, 1)
+            sup = total_supply.get(cat, 0)
+            fulfillment_rates.append(min(1.0, sup / d) if d > 0 else 1.0)
+        fulfillment = sum(fulfillment_rates) / len(fulfillment_rates)
 
-        # --- Budget compliance (20%) ---
-        if total_cost <= budget:
-            budget_score = 1.0
-        elif total_cost <= budget * 1.2:
-            budget_score = 1.0 - (total_cost - budget) / (budget * 0.2)
-        else:
-            budget_score = max(0.0, 0.5 - (total_cost - budget * 1.2) / budget)
+        # Budget
+        budget_score = 1.0 if s["budget_remaining"] >= 0 else max(
+            0.0, 1.0 + s["budget_remaining"] / s["budget"]
+        )
 
-        # --- Disruption handling (20%) ---
-        if ordered_to_offline == 0:
-            disruption_score = 1.0
-        else:
-            disruption_score = max(0.0, 1.0 - ordered_to_offline * 0.3)
+        # Disruption
+        disruption_score = 1.0 if ordered_offline == 0 else max(
+            0.0, 1.0 - ordered_offline * 0.3
+        )
 
-        # --- Inventory balance (15%) ---
-        wh_fill_rates = []
-        for wh_id, wh in warehouses.items():
-            total_wh = sum(wh["inventory"].values()) + sum(
-                incoming.get(wh_id, {}).values()
+        # Balance
+        fill_rates = []
+        for wh in s["warehouses"]:
+            fill_rates.append(
+                wh["current_total"] / wh["max_capacity"]
+                if wh["max_capacity"] > 0 else 0.0
             )
-            cap = wh["max_capacity"]
-            wh_fill_rates.append(total_wh / cap if cap > 0 else 0.0)
-        if len(wh_fill_rates) > 1:
-            mean_fill = sum(wh_fill_rates) / len(wh_fill_rates)
-            var = sum((r - mean_fill) ** 2 for r in wh_fill_rates) / len(wh_fill_rates)
-            balance_score = max(0.0, 1.0 - math.sqrt(var) * 2)
+        if len(fill_rates) > 1:
+            mean_f = sum(fill_rates) / len(fill_rates)
+            var = sum((r - mean_f) ** 2 for r in fill_rates) / len(fill_rates)
+            balance = max(0.0, 1.0 - math.sqrt(var) * 2)
         else:
-            balance_score = 1.0
+            balance = 1.0
 
-        # --- Waste prevention (15%) ---
+        # Overstock
         overstock_penalties = []
         for cat in PRODUCT_CATEGORIES:
-            demand = total_demand.get(cat, 1)
-            supply = total_supply.get(cat, 0)
-            if supply > demand * 1.2:
-                excess = (supply - demand * 1.2) / demand
-                overstock_penalties.append(min(1.0, excess))
+            d = total_demand.get(cat, 1)
+            sup = total_supply.get(cat, 0)
+            if sup > d * 1.2:
+                overstock_penalties.append(min(1.0, (sup - d * 1.2) / d))
             else:
                 overstock_penalties.append(0.0)
-        waste_score = 1.0 - (
+        waste = 1.0 - (
             sum(overstock_penalties) / len(overstock_penalties)
-            if overstock_penalties
-            else 0.0
+            if overstock_penalties else 0.0
         )
 
-        total = (
-            0.30 * demand_fulfillment
-            + 0.20 * budget_score
-            + 0.20 * disruption_score
-            + 0.15 * balance_score
-            + 0.15 * waste_score
+        reward = (
+            0.30 * fulfillment + 0.20 * budget_score + 0.20 * disruption_score
+            + 0.15 * balance + 0.15 * waste
         )
 
-        # If agent submitted no orders at all, they still get credit for
-        # existing inventory fulfillment + not overspending + not ordering
-        # from offline supplier — this ensures score variance.
-
-        breakdown = {
-            "demand_fulfillment": round(demand_fulfillment, 3),
-            "budget_compliance": round(budget_score, 3),
-            "disruption_handling": round(disruption_score, 3),
-            "inventory_balance": round(balance_score, 3),
-            "waste_prevention": round(waste_score, 3),
-        }
         feedback = (
-            f"Score: {total:.2f}/1.00 | "
-            f"Fulfillment: {demand_fulfillment:.0%} | "
-            f"Cost: ${total_cost:.0f}/{budget:.0f} budget | "
-            f"Offline orders: {ordered_to_offline}"
+            f"Fulfillment: {fulfillment:.0%} | "
+            f"Budget left: ${s['budget_remaining']:.0f} | "
+            f"Offline orders: {ordered_offline} | "
+            f"Cost this step: ${step_cost:.0f}"
         )
-        return total, breakdown, feedback
+        return reward, feedback
 
-    # ==================================================================
-    # Scenario formatting (human-readable for LLM)
-    # ==================================================================
+    def _apply_surge_event_step2(self):
+        """Disruption: one supplier goes offline."""
+        s = self._env_state
+        sid = s["_offline_supplier"]
+        for sup in s["suppliers"]:
+            if sup["supplier_id"] == sid:
+                sup["status"] = "OFFLINE"
+                s["_events_applied"].append(
+                    f"DISRUPTION: Supplier {sid} ({sup['name']}) is now OFFLINE "
+                    f"and cannot fulfill any orders."
+                )
+                break
 
-    def _format_scenario_text(
-        self, task_name: str, data: Dict[str, Any]
-    ) -> str:
-        if task_name == "shelf_restock":
-            return self._format_shelf_restock(data)
-        elif task_name == "delivery_routing":
-            return self._format_delivery_routing(data)
-        elif task_name == "demand_surge":
-            return self._format_demand_surge(data)
-        return ""
-
-    def _format_shelf_restock(self, data: Dict[str, Any]) -> str:
-        lines = [
-            "=== SHELF RESTOCK PRIORITY ===",
-            "",
-            f"You are a store manager. You have time to restock only {data['restock_slots']} products before the store opens.",
-            "Choose which products to restock, ordered by priority (most urgent first).",
-            "",
-            "Product Inventory:",
-            f"{'ID':<6} {'Name':<25} {'Stock':>6} {'Daily Sales':>12} {'Capacity':>9} {'Revenue/Unit':>13}",
-            "-" * 75,
-        ]
-        for p in data["products"]:
-            days_left = (
-                round(p["current_stock"] / p["daily_sales_rate"], 1)
-                if p["daily_sales_rate"] > 0
-                else 999.0
+    def _apply_surge_event_step3(self):
+        """Demand forecast updates."""
+        s = self._env_state
+        changes = s["_demand_changes"]
+        for cat, multiplier in changes.items():
+            for store in s["stores"]:
+                old = store["demand_forecast"][cat]
+                store["demand_forecast"][cat] = int(old * multiplier)
+            old_total = s["total_demand"][cat]
+            s["total_demand"][cat] = sum(
+                st["demand_forecast"][cat] for st in s["stores"]
             )
+            direction = "increased" if multiplier > 1 else "decreased"
+            s["_events_applied"].append(
+                f"DEMAND UPDATE: {cat} demand {direction} "
+                f"({old_total} → {s['total_demand'][cat]} units)."
+            )
+
+    def _apply_surge_event_step4(self):
+        """Warehouse capacity alert."""
+        s = self._env_state
+        wh_id = s["_capacity_alert_wh"]
+        for wh in s["warehouses"]:
+            if wh["warehouse_id"] == wh_id:
+                wh["max_capacity"] = int(wh["max_capacity"] * 0.7)
+                s["_events_applied"].append(
+                    f"CAPACITY ALERT: {wh_id} max capacity reduced to "
+                    f"{wh['max_capacity']} (section closed for maintenance)."
+                )
+                break
+
+    # ==================================================================
+    # Scenario text formatting
+    # ==================================================================
+
+    def _build_scenario_text(self) -> str:
+        formatters = {
+            "shelf_restock": self._format_shelf_restock,
+            "delivery_routing": self._format_delivery_routing,
+            "demand_surge": self._format_demand_surge,
+        }
+        return formatters[self._task_name]()
+
+    def _format_shelf_restock(self) -> str:
+        s = self._env_state
+        step = self._step_num + 1  # next step to take
+        slots = s["slots_per_step"][step - 1]
+        restocked = s["restocked"]
+
+        lines = [
+            f"=== SHELF RESTOCK PRIORITY — Step {step}/{self._max_steps} ===",
+            "",
+        ]
+
+        # Show events if any new ones
+        events = s.get("_events_applied", [])
+        if events:
+            for e in events:
+                lines.append(f"** EVENT: {e}")
+            lines.append("")
+            s["_events_applied"] = []
+
+        if restocked:
+            lines.append(f"Already restocked: {', '.join(restocked)}")
+            lines.append("")
+
+        lines.extend([
+            f"Select {slots} product(s) to restock NOW (most urgent first).",
+            "",
+            f"{'ID':<6} {'Name':<25} {'Stock':>6} {'Daily Sales':>12} {'Capacity':>9} {'$/Unit':>8}",
+            "-" * 70,
+        ])
+
+        for p in s["products"]:
+            if p["product_id"] in restocked:
+                continue
+            days_left = round(
+                p["current_stock"] / p["daily_sales_rate"], 1
+            ) if p["daily_sales_rate"] > 0 else 999.0
             lines.append(
                 f"{p['product_id']:<6} {p['name']:<25} {p['current_stock']:>6} "
                 f"{p['daily_sales_rate']:>12.1f} {p['shelf_capacity']:>9} "
-                f"${p['unit_revenue']:>12.2f}   ({days_left:.1f} days left)"
+                f"${p['unit_revenue']:>7.2f}  ({days_left:.1f}d left)"
             )
-        lines.extend(
-            [
-                "",
-                f"Select exactly {data['restock_slots']} products to restock, ordered by urgency.",
-                "Consider: products with low stock, high sales rate, and high revenue should be prioritized.",
-                "",
-                'Respond with JSON: {"restock_products": ["P001", "P002", "P003", "P004"]}',
-            ]
-        )
+
+        lines.extend([
+            "",
+            f'Respond with JSON: {{"restock_products": ["P001", "P002"]}}',
+            f"Select exactly {slots} product ID(s) from the table above.",
+        ])
         return "\n".join(lines)
 
-    def _format_delivery_routing(self, data: Dict[str, Any]) -> str:
+    def _format_delivery_routing(self) -> str:
+        s = self._env_state
+        step = self._step_num + 1
+
         lines = [
-            "=== DELIVERY ROUTE ASSIGNMENT ===",
+            f"=== DELIVERY ROUTING — Step {step}/{self._max_steps} ===",
             "",
-            "You are a distribution center dispatcher. Assign each delivery order to a driver.",
-            "",
-            "Delivery Orders:",
-            f"{'Order':<8} {'Destination':<16} {'Weight(kg)':>10} {'Deadline(hrs)':>13} {'Priority':<10}",
-            "-" * 60,
         ]
-        for o in data["orders"]:
+
+        events = s.get("_events_applied", [])
+        if events:
+            for e in events:
+                lines.append(f"** EVENT: {e}")
+            lines.append("")
+            s["_events_applied"] = []
+
+        # Pending orders
+        pending = [o for o in s["orders"] if o["status"] == "pending"]
+        if pending:
+            lines.extend([
+                "PENDING ORDERS:",
+                f"{'Order':<8} {'Destination':<16} {'Weight':>8} {'Deadline':>10} {'Priority':<8}",
+                "-" * 55,
+            ])
+            for o in pending:
+                lines.append(
+                    f"{o['order_id']:<8} {o['destination']:<16} {o['weight_kg']:>7.1f}kg "
+                    f"{o['deadline_hours']:>9.1f}h {o['priority']:<8}"
+                )
+        else:
+            lines.append("All orders assigned.")
+
+        lines.extend(["", "DRIVERS:"])
+        for d in s["drivers"]:
+            remaining_cap = d["vehicle_capacity_kg"] - d["used_capacity_kg"]
             lines.append(
-                f"{o['order_id']:<8} {o['destination']:<16} {o['weight_kg']:>10.1f} "
-                f"{o['deadline_hours']:>13.1f} {o['priority']:<10}"
+                f"  {d['driver_id']}: capacity {remaining_cap:.0f}kg remaining "
+                f"({d['used_capacity_kg']:.0f}/{d['vehicle_capacity_kg']}kg used), "
+                f"shift {d['remaining_shift_hours']:.1f}h left, "
+                f"orders: {d['assigned_orders'] or 'none'}"
             )
-        lines.extend(
-            [
+
+        lines.extend(["", "DISTANCES (from DC):"])
+        for dest, dist in s["distances_from_dc"].items():
+            tt = round(dist / s["speed_kmh"], 2)
+            lines.append(f"  {dest}: {dist}km (~{tt}h)")
+
+        if pending:
+            lines.extend([
                 "",
-                "Available Drivers:",
-                f"{'Driver':<8} {'Capacity(kg)':>12} {'Shift Left(hrs)':>15}",
-                "-" * 38,
-            ]
-        )
-        for d in data["drivers"]:
-            lines.append(
-                f"{d['driver_id']:<8} {d['vehicle_capacity_kg']:>12} "
-                f"{d['remaining_shift_hours']:>15.1f}"
-            )
-        lines.extend(
-            [
+                "Assign pending orders to drivers. Consider capacity, deadlines, and balance.",
+                '{"assignments": [{"order_id": "ORD001", "driver_id": "D1"}, ...]}',
+            ])
+        else:
+            lines.extend([
                 "",
-                "Distances from DC (km):",
-            ]
-        )
-        for dest, dist in data["distances_from_dc"].items():
-            travel_time = round(dist / data["speed_kmh"], 2)
-            lines.append(f"  {dest}: {dist}km (~{travel_time}hrs at {data['speed_kmh']}km/h)")
-        lines.extend(
-            [
-                "",
-                "Assign ALL orders to drivers. Consider capacity, deadlines, and balance workload.",
-                "",
-                'Respond with JSON: {"assignments": [{"order_id": "ORD001", "driver_id": "D1"}, ...]}',
-            ]
-        )
+                "All orders assigned. You may reassign by providing new assignments.",
+                '{"assignments": []}',
+            ])
         return "\n".join(lines)
 
-    def _format_demand_surge(self, data: Dict[str, Any]) -> str:
+    def _format_demand_surge(self) -> str:
+        s = self._env_state
+        step = self._step_num + 1
+
         lines = [
-            "=== DEMAND SURGE PLANNING WITH DISRUPTION ===",
+            f"=== DEMAND SURGE PLANNING — Step {step}/{self._max_steps} ===",
+            f"Budget remaining: ${s['budget_remaining']:.0f} / ${s['budget']:.0f}",
             "",
-            f"A festival is approaching in {data['surge_days']} days. Plan procurement and redistribution.",
-            f"Budget: ${data['budget']:.0f}",
-            "",
-            "Warehouse Inventory:",
         ]
-        for wh in data["warehouses"]:
+
+        events = s.get("_events_applied", [])
+        if events:
+            for e in events:
+                lines.append(f"** EVENT: {e}")
+            lines.append("")
+            s["_events_applied"] = []
+
+        lines.append("WAREHOUSE INVENTORY:")
+        for wh in s["warehouses"]:
             lines.append(
-                f"  {wh['warehouse_id']} (capacity: {wh['max_capacity']}, used: {wh['current_total']}):"
+                f"  {wh['warehouse_id']} ({wh['current_total']}/{wh['max_capacity']} used):"
             )
             for cat, qty in wh["inventory"].items():
-                lines.append(f"    {cat}: {qty} units")
+                lines.append(f"    {cat}: {qty}")
 
-        lines.extend(["", "Suppliers:"])
-        for s in data["suppliers"]:
-            status_marker = " ** OFFLINE **" if s["status"] == "OFFLINE" else ""
+        lines.extend(["", "SUPPLIERS:"])
+        for sup in s["suppliers"]:
+            status = " ** OFFLINE **" if sup["status"] == "OFFLINE" else ""
             lines.append(
-                f"  {s['supplier_id']} ({s['name']}){status_marker}: "
-                f"${s['price_per_unit']}/unit, {s['lead_time_days']}d lead time, "
-                f"reliability {s['reliability_score']}, max qty {s['max_order_qty']}"
+                f"  {sup['supplier_id']} ({sup['name']}){status}: "
+                f"${sup['price_per_unit']}/unit, {sup['lead_time_days']}d lead, "
+                f"max {sup['max_order_qty']} units"
             )
 
-        lines.extend(["", "Store Demand Forecasts (next 5 days):"])
-        for store in data["stores"]:
-            lines.append(f"  {store['store_name']}:")
-            for cat, qty in store["demand_forecast"].items():
-                lines.append(f"    {cat}: {qty} units")
+        lines.extend(["", "TOTAL DEMAND FORECAST:"])
+        for cat, qty in s["total_demand"].items():
+            total_supply = sum(
+                wh["inventory"].get(cat, 0) for wh in s["warehouses"]
+            )
+            gap = max(0, qty - total_supply)
+            status = f"GAP: {gap}" if gap > 0 else "COVERED"
+            lines.append(f"  {cat}: {qty} needed, {total_supply} available — {status}")
 
-        lines.extend(["", "Total Demand by Category:"])
-        for cat, qty in data["total_demand"].items():
-            lines.append(f"  {cat}: {qty} units")
-
-        lines.extend(
-            [
-                "",
-                "DISRUPTION: One supplier is OFFLINE and cannot fulfill orders.",
-                "",
-                "Create a plan with:",
-                "1. procurement_orders: which suppliers to order from, what product, quantity, and destination warehouse",
-                "2. redistribution: move inventory between warehouses to balance supply",
-                "",
-                "Stay within budget. Do NOT order from the OFFLINE supplier. Minimize overstock.",
-                "",
-                "Respond with JSON:",
-                '{"procurement_orders": [{"supplier_id": "S1", "product": "rice", "quantity": 100, "destination_warehouse": "WH1"}, ...],',
-                ' "redistribution": [{"from_warehouse": "WH1", "to_warehouse": "WH3", "product": "flour", "quantity": 50}, ...]}',
-            ]
-        )
+        lines.extend([
+            "",
+            "Place procurement orders and/or redistribute inventory.",
+            "Do NOT order from OFFLINE suppliers. Stay within budget.",
+            "",
+            '{"procurement_orders": [{"supplier_id": "S1", "product": "rice", '
+            '"quantity": 100, "destination_warehouse": "WH1"}, ...],',
+            ' "redistribution": [{"from_warehouse": "WH1", "to_warehouse": "WH2", '
+            '"product": "flour", "quantity": 50}, ...]}',
+        ])
         return "\n".join(lines)

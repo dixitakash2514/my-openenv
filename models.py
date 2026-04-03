@@ -7,10 +7,11 @@
 """
 Data models for the Supply Chain Retail Environment.
 
-Three tasks: shelf_restock (easy), delivery_routing (medium), demand_surge (hard).
+Three multi-step tasks: shelf_restock (easy, 3 steps), delivery_routing (medium, 4 steps),
+demand_surge (hard, 5 steps).
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from openenv.core.env_server.types import Action, Observation
 from pydantic import Field
@@ -33,6 +34,8 @@ class SupplyChainObservation(Observation):
     """Observation from the Supply Chain environment."""
 
     task_name: str = Field(default="", description="Current task identifier")
+    step_number: int = Field(default=0, description="Current step in the episode")
+    total_steps: int = Field(default=1, description="Total steps in this task")
     scenario_text: str = Field(
         default="", description="Human-readable scenario for the LLM agent"
     )
@@ -40,8 +43,8 @@ class SupplyChainObservation(Observation):
         default_factory=dict, description="Structured scenario data"
     )
     score_breakdown: Dict[str, float] = Field(
-        default_factory=dict, description="Per-criterion scores after grading"
+        default_factory=dict, description="Per-criterion scores (final step only)"
     )
     feedback: str = Field(
-        default="", description="Grader feedback text after step"
+        default="", description="Brief feedback per step, detailed on final step"
     )

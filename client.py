@@ -39,6 +39,8 @@ class SupplyChainEnv(
         obs_data = payload.get("observation", {})
         observation = SupplyChainObservation(
             task_name=obs_data.get("task_name", ""),
+            step_number=obs_data.get("step_number", 0),
+            total_steps=obs_data.get("total_steps", 1),
             scenario_text=obs_data.get("scenario_text", ""),
             scenario_data=obs_data.get("scenario_data", {}),
             score_breakdown=obs_data.get("score_breakdown", {}),
