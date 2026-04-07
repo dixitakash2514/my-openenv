@@ -5,3 +5,12 @@ __pycache__/
 .env
 .agents/
 .claude/
+
+# Training artifacts
+training/checkpoints/
+training/runs/
+training/results/
+training/wandb/
+*.safetensors
+*.bin
+*.pt
