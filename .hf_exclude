@@ -1,0 +1,17 @@
+training/
+training/**
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.git/
+.claude/
+.agents/
+.env
+*.ipynb
+Hackathon-assets/

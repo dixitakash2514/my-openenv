@@ -31,7 +31,7 @@ app = create_app(
     SupplyChainAction,
     SupplyChainObservation,
     env_name="supply_chain_retail",
-    max_concurrent_envs=1,
+    max_concurrent_envs=16,
 )
 
 

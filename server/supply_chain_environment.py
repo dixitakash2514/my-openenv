@@ -19,7 +19,7 @@ from uuid import uuid4
 import random as random_module
 
 from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import State
+from openenv.core.env_server.types import EnvironmentMetadata, State
 
 try:
     from ..models import SupplyChainAction, SupplyChainObservation
@@ -185,6 +185,36 @@ class SupplyChainEnvironment(Environment):
     def state(self) -> State:
         return self._state
 
+    def get_metadata(self) -> EnvironmentMetadata:
+        """Rich metadata for /metadata endpoint — what judges see when probing the env."""
+        return EnvironmentMetadata(
+            name="supply_chain_retail",
+            description=(
+                "Supply Chain Retail — a stateful, multi-step OpenEnv for training "
+                "and evaluating LLM agents on real-world supply chain decisions. "
+                "Three tasks with dynamic mid-episode events:\n"
+                "  1. shelf_restock (easy, 3 steps): prioritize products to restock as "
+                "demand spikes and surprise deliveries arrive. "
+                "Reward = 0.6*selection_accuracy + 0.4*feasibility.\n"
+                "  2. delivery_routing (medium, 4 steps): assign orders to drivers under "
+                "capacity, deadline, traffic, and breakdown constraints. "
+                "Reward = 0.30*on_time + 0.25*capacity + 0.25*coverage + 0.20*balance.\n"
+                "  3. demand_surge (hard, 5 steps): procure inventory across warehouses "
+                "while a supplier goes offline, demand forecasts shift, and warehouse "
+                "capacity is cut. "
+                "Reward = 0.30*fulfillment + 0.20*budget + 0.20*disruption + "
+                "0.15*balance + 0.15*waste.\n"
+                "All graders are deterministic (seeded), return rewards in [0,1], and "
+                "penalize 'do nothing' so the score reflects real decision quality. "
+                "Action: {decision: dict, reasoning: str}. "
+                "Observation: {task_name, step_number, total_steps, scenario_text, "
+                "scenario_data, feedback, score_breakdown, done, reward}."
+            ),
+            version="2.0.0",
+            author="Akash Dixit (BlackEagle)",
+            documentation_url="https://github.com/dixitakash2514/my-openenv",
+        )
+
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
@@ -290,7 +320,8 @@ class SupplyChainEnvironment(Environment):
 
         feedback = (
             f"Picked: {valid_picks} | Optimal: {optimal} | "
-            f"Correct: {len(correct)}/{slots}"
+            f"Correct: {len(correct)}/{slots} | "
+            f"selection={selection_score:.2f} feasibility={feasibility:.2f}"
         )
         return reward, feedback
 
@@ -451,16 +482,21 @@ class SupplyChainEnvironment(Environment):
 
         on_time_rate = on_time / assigned_total if assigned_total > 0 else 0.0
 
-        # Capacity check
+        # Capacity check — but no free credit for "do nothing".
+        # Previously: empty action gave cap_score=1.0 (no violations) → reward=0.25
+        # constant. Now we require actual assignments before granting capacity credit.
         violations = sum(
             1 for d in drivers if d["used_capacity_kg"] > d["vehicle_capacity_kg"]
         )
-        cap_score = 1.0 - violations / len(drivers)
+        if assigned_total == 0:
+            cap_score = 0.0
+        else:
+            cap_score = 1.0 - violations / len(drivers)
 
         # Coverage (how many orders assigned so far vs total)
         coverage = assigned_total / total if total > 0 else 0.0
 
-        # Balance
+        # Balance — already gated on sum(counts) > 0
         counts = [len(d["assigned_orders"]) for d in drivers]
         if sum(counts) > 0:
             mean_c = sum(counts) / len(counts)
@@ -474,7 +510,9 @@ class SupplyChainEnvironment(Environment):
         feedback = (
             f"Assigned this step: {newly_assigned} | "
             f"Total assigned: {assigned_total}/{total} | "
-            f"On-time: {on_time} | Capacity violations: {violations}"
+            f"On-time: {on_time} | Capacity violations: {violations} | "
+            f"on_time={on_time_rate:.2f} cap={cap_score:.2f} "
+            f"coverage={coverage:.2f} balance={balance:.2f}"
         )
         return reward, feedback
 
@@ -593,6 +631,8 @@ class SupplyChainEnvironment(Environment):
         suppliers = {sup["supplier_id"]: sup for sup in s["suppliers"]}
         ordered_offline = 0
         step_cost = 0.0
+        successful_orders = 0
+        successful_redistributions = 0
 
         for order in procurement:
             if not isinstance(order, dict):
@@ -627,6 +667,7 @@ class SupplyChainEnvironment(Environment):
 
             s["budget_remaining"] -= cost
             step_cost += cost
+            successful_orders += 1
             wh["inventory"][product] = wh["inventory"].get(product, 0) + actual_qty
             wh["current_total"] += actual_qty
             s["procurement_log"].append({
@@ -663,6 +704,7 @@ class SupplyChainEnvironment(Environment):
                 src["current_total"] -= actual
                 dst["inventory"][product] = dst["inventory"].get(product, 0) + actual
                 dst["current_total"] += actual
+                successful_redistributions += 1
                 s["redistribution_log"].append({
                     "step": step, "from": from_wh, "to": to_wh,
                     "product": product, "quantity": actual,
@@ -670,6 +712,7 @@ class SupplyChainEnvironment(Environment):
 
         # --- Grade this step ---
         total_demand = s["total_demand"]
+        any_action = successful_orders > 0 or successful_redistributions > 0
 
         # Fulfillment
         total_supply = {cat: 0 for cat in PRODUCT_CATEGORIES}
@@ -684,15 +727,23 @@ class SupplyChainEnvironment(Environment):
             fulfillment_rates.append(min(1.0, sup / d) if d > 0 else 1.0)
         fulfillment = sum(fulfillment_rates) / len(fulfillment_rates)
 
-        # Budget
-        budget_score = 1.0 if s["budget_remaining"] >= 0 else max(
-            0.0, 1.0 + s["budget_remaining"] / s["budget"]
-        )
+        # Budget — no free credit for "spent nothing".
+        # Previously: empty action gave budget_score=1.0. Now we require any_action.
+        if not any_action:
+            budget_score = 0.2
+        elif s["budget_remaining"] >= 0:
+            budget_score = 1.0
+        else:
+            budget_score = max(0.0, 1.0 + s["budget_remaining"] / s["budget"])
 
-        # Disruption
-        disruption_score = 1.0 if ordered_offline == 0 else max(
-            0.0, 1.0 - ordered_offline * 0.3
-        )
+        # Disruption — no free credit for "didn't order from offline supplier
+        # because didn't order at all". Require any_action before giving full credit.
+        if not any_action:
+            disruption_score = 0.2
+        elif ordered_offline == 0:
+            disruption_score = 1.0
+        else:
+            disruption_score = max(0.0, 1.0 - ordered_offline * 0.3)
 
         # Balance
         fill_rates = []
@@ -708,7 +759,8 @@ class SupplyChainEnvironment(Environment):
         else:
             balance = 1.0
 
-        # Overstock
+        # Overstock — gate "no waste" claim on actually managing inventory.
+        # Previously: empty action → waste=1.0 (perfect score for inaction).
         overstock_penalties = []
         for cat in PRODUCT_CATEGORIES:
             d = total_demand.get(cat, 1)
@@ -721,6 +773,12 @@ class SupplyChainEnvironment(Environment):
             sum(overstock_penalties) / len(overstock_penalties)
             if overstock_penalties else 0.0
         )
+        # No action = no inventory management claim. Half credit if inactive,
+        # additional half-credit haircut if shelves are still mostly empty.
+        if not any_action:
+            waste *= 0.3
+        elif fulfillment < 0.5:
+            waste *= 0.5
 
         reward = (
             0.30 * fulfillment + 0.20 * budget_score + 0.20 * disruption_score
@@ -731,7 +789,10 @@ class SupplyChainEnvironment(Environment):
             f"Fulfillment: {fulfillment:.0%} | "
             f"Budget left: ${s['budget_remaining']:.0f} | "
             f"Offline orders: {ordered_offline} | "
-            f"Cost this step: ${step_cost:.0f}"
+            f"Cost this step: ${step_cost:.0f} | "
+            f"Orders={successful_orders} Redist={successful_redistributions} | "
+            f"fulfill={fulfillment:.2f} budget={budget_score:.2f} "
+            f"disrupt={disruption_score:.2f} balance={balance:.2f} waste={waste:.2f}"
         )
         return reward, feedback
 

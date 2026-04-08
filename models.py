@@ -11,7 +11,7 @@ Three multi-step tasks: shelf_restock (easy, 3 steps), delivery_routing (medium,
 demand_surge (hard, 5 steps).
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from openenv.core.env_server.types import Action, Observation
 from pydantic import Field
@@ -42,8 +42,9 @@ class SupplyChainObservation(Observation):
     scenario_data: Dict[str, Any] = Field(
         default_factory=dict, description="Structured scenario data"
     )
-    score_breakdown: Dict[str, float] = Field(
-        default_factory=dict, description="Per-criterion scores (final step only)"
+    score_breakdown: Optional[Dict[str, float]] = Field(
+        default=None,
+        description="Per-criterion scores. Populated only on terminal step (done=True).",
     )
     feedback: str = Field(
         default="", description="Brief feedback per step, detailed on final step"

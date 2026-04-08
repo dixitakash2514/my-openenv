@@ -1,0 +1,24 @@
+# Training artifacts — never ship to docker image
+training/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Local virtualenvs and caches
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editor / git / Claude
+.git/
+.gitignore
+.claude/
+.agents/
+.env
+
+# Notebooks and large local-only assets
+*.ipynb
+Hackathon-assets/
