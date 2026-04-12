@@ -155,7 +155,7 @@ class SupplyChainEnvironment(Environment):
             scenario_text=scenario_text,
             scenario_data=self._get_public_state(),
             done=False,
-            reward=0.0,
+            reward=0.001,
         )
 
     def step(self, action: SupplyChainAction, **kwargs) -> SupplyChainObservation:
@@ -172,14 +172,14 @@ class SupplyChainEnvironment(Environment):
         }
 
         reward, feedback = step_handlers[self._task_name](action.decision)
-        reward = max(0.0, min(1.0, reward))
+        reward = max(0.001, min(0.999, reward))
         self._step_rewards.append(reward)
 
         is_done = self._step_num >= self._max_steps
 
         # Build next observation
         if is_done:
-            final_score = sum(self._step_rewards) / len(self._step_rewards)
+            final_score = max(0.001, min(0.999, sum(self._step_rewards) / len(self._step_rewards)))
             breakdown = self._get_final_breakdown()
             final_feedback = (
                 f"Episode complete. Final score: {final_score:.3f} | "
@@ -661,10 +661,10 @@ class SupplyChainEnvironment(Environment):
         total_weight_now = sum(o["weight_kg"] for o in orders)
         step_optimal = total_weight_now * DELIVERY_UNIT_REVENUE_PER_KG
         if step_optimal <= 0:
-            reward = 0.0
+            reward = 0.001
         else:
             reward = step_profit / step_optimal
-            reward = max(0.0, min(1.0, reward))
+            reward = max(0.001, min(0.999, reward))
 
         feedback = (
             f"Assigned +{newly_assigned} "
@@ -1000,10 +1000,10 @@ class SupplyChainEnvironment(Environment):
         optimal = s.get("_optimal_profit", 1.0)
         denom = optimal - baseline
         if denom <= 0:
-            reward = 0.0
+            reward = 0.001
         else:
             reward = (step_profit - baseline) / denom
-            reward = max(0.0, min(1.0, reward))
+            reward = max(0.001, min(0.999, reward))
 
         feedback = (
             f"Orders: {successful_orders} delivered, {failed_orders} failed "

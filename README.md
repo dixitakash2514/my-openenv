@@ -25,9 +25,9 @@ tags:
 
 | Task | Do-Nothing | Random | Heuristic | Gap |
 |---|---:|---:|---:|---:|
-| **shelf_restock** (easy, 3 steps) | 0.000 ± 0.000 | 0.133 ± 0.159 | **0.900** ± 0.157 | 0.77 |
-| **delivery_routing** (medium, 4 steps) | 0.000 ± 0.000 | 0.284 ± 0.159 | **0.735** ± 0.021 | 0.45 |
-| **demand_surge** (hard, 5 steps) | 0.008 ± 0.014 | 0.246 ± 0.091 | **0.943** ± 0.057 | 0.70 |
+| **shelf_restock** (easy, 3 steps) | 0.001 ± 0.000 | 0.134 ± 0.158 | **0.899** ± 0.156 | 0.77 |
+| **delivery_routing** (medium, 4 steps) | 0.001 ± 0.000 | 0.284 ± 0.159 | **0.735** ± 0.021 | 0.45 |
+| **demand_surge** (hard, 5 steps) | 0.009 ± 0.013 | 0.246 ± 0.091 | **0.943** ± 0.057 | 0.70 |
 
 Three signals worth highlighting:
 - **Inaction is punished.** Empty actions score 0.00 on easy/medium tasks; ≈0.01 on the hard task. Every P&L formula has a built-in cost for unmet demand and unfulfilled orders.
