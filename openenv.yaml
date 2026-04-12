@@ -1,5 +1,9 @@
 spec_version: 1
 name: supply_chain_retail
+description: >-
+  Stateful multi-step supply chain benchmark with P&L-based grading.
+  Three tasks (shelf restock, delivery routing, demand surge) with dynamic
+  mid-episode events, stochastic supplier reliability, and VRP-TW constraints.
 type: space
 runtime: fastapi
 app: server.app:app
